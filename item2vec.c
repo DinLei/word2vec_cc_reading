@@ -28,32 +28,31 @@
 #define MAX_SENTENCE_LENGTH 1000
 #define MAX_CODE_LENGTH 40
 
-// 序列结尾 增加 非global_context 标识
-#define NO_GloBAL 0
+#define STR1(R) #R
+#define STR2(R) STR1(R)
 
 const int vocab_hash_size = 30000000;  // Maximum 30 * 0.7 = 21M words in the vocabulary
 
 typedef float real;                    // Precision of float numbers
 
-// 词表结构
+// 商品表结构
 struct vocab_word {
   long long cn;
-  // 从 CreateBinaryTree 的代码可知, point代表 一个单词 在 Huffman二叉树中 的节点路径: 根节点->非叶子节点->叶子节点
-  // HS的参数矩阵 syn1, 参数量 = vocab_size * embedding_size, 该参数矩阵实际使用行数仅 vocab_size - 1( 非叶子节点数量: vocab_size - 1 )
-  // 所以，直接定义 根节点 在 syn1 中的 行索引: vocab_size - 2
-  // 其他非叶子节点 在 syn1 中的 行索引: parent_node_index - vocab_size 
-  int *point;
-  // word: 当前的单词
-  // code: 当前单词的Huffman编码，不包含root
-  char *word, *code, codelen;
+  char *word;
 };
 
+typedef struct entity {
+  int hash_idx;
+  int action;
+} Entity;
+
+// 行为序列需要加入具体行为标签
 char train_file[MAX_STRING], output_file[MAX_STRING];
 char save_vocab_file[MAX_STRING], read_vocab_file[MAX_STRING];
 
-// 词汇表
+// 商品表
 struct vocab_word *vocab;
-int binary = 0, cbow = 1, debug_mode = 2, window = 5, min_count = 5, num_threads = 12, min_reduce = 1;
+int binary = 0, debug_mode = 2, window = 5, min_count = 5, num_threads = 12, min_reduce = 1, use_global_context = 1;
 
 // 先算出词汇的hash，vocab_hash[hash]就是word在vocab中的下标
 int *vocab_hash;
@@ -67,7 +66,7 @@ real alpha = 0.025, starting_alpha, sample = 1e-3;
 real *syn0, *syn1neg, *expTable;
 clock_t start;
 
-int hs = 0, negative = 5;
+int negative = 5;
 const int table_size = 1e8;
 int *table;
 
@@ -92,8 +91,13 @@ void InitUnigramTable() {
 }
 
 // Reads a single word from a file, assuming space + tab + EOL to be word boundaries
-void ReadWord(char *word, FILE *fin, char *eof) {
+// 我们在读取行为序列训练数据的时候, 因为要得到每个商品对应的行为类型, 所以将训练数据构造如下: item01:1 item02:1 item03:3
+// 商品id 和 行为类型标识 之间固定用 ‘:’ 进行间隔, 且 行为类型标识 固定为 4字节的int
+// 标识的具体含义自定义, 如 1:点击, 2:收藏, 3:购买
+// 这里沿用word2vec.cc的原函数名, 只改传参, 为了方便两块代码做比较
+void ReadWord(char *word, int *action, FILE *fin, char *eof) {
   int a = 0, ch;
+  action = 0;
   while (1) {
     ch = fgetc_unlocked(fin);
     // 文件结尾，end of file
@@ -103,6 +107,10 @@ void ReadWord(char *word, FILE *fin, char *eof) {
     }
     // 回车键
     if (ch == 13) continue;
+    if (ch == ':') {
+      ch = fgetc_unlocked(fin);
+      action = ch - '0'; continue;
+    }
     if ((ch == ' ') || (ch == '\t') || (ch == '\n')) {
       if (a > 0) {
         // 用换行符表示一个句子的开始符号，所以读入换行符后，还需要重新写回
@@ -148,15 +156,17 @@ int SearchVocab(char *word) {
 
 // Reads a word and returns its index in the vocabulary
 // 返回单词的position
-int ReadWordIndex(FILE *fin, char *eof) {
+ReadWordIndex(FILE *fin, char *eof, Entity* ent) {
   char word[MAX_STRING], eof_l = 0;
-  ReadWord(word, fin, &eof_l);
+  int action = 0;
+  ReadWord(word, action, fin, &eof_l);
   // 一直找到文件末尾
   if (eof_l) {
     *eof = 1;
     return -1;
   }
-  return SearchVocab(word);
+  ent->hash_idx = SearchVocab(word);
+  ent->action = action;
 }
 
 // Adds a word to the vocabulary
@@ -214,11 +224,6 @@ void SortVocab() {
     }
   }
   vocab = (struct vocab_word *)realloc(vocab, (vocab_size + 1) * sizeof(struct vocab_word));
-  // Allocate memory for the binary tree construction
-  for (a = 0; a < vocab_size; a++) {
-    vocab[a].code = (char *)calloc(MAX_CODE_LENGTH, sizeof(char));
-    vocab[a].point = (int *)calloc(MAX_CODE_LENGTH, sizeof(int));
-  }
 }
 
 // Reduces the vocabulary by removing infrequent tokens
@@ -246,6 +251,7 @@ void ReduceVocab() {
 void LearnVocabFromTrainFile() {
   char word[MAX_STRING], eof = 0;
   FILE *fin;
+  int action_t = 0;
   long long a, i, wc = 0;
   for (a = 0; a < vocab_hash_size; a++) vocab_hash[a] = -1;
   fin = fopen(train_file, "rb");
@@ -256,7 +262,7 @@ void LearnVocabFromTrainFile() {
   vocab_size = 0;
   AddWordToVocab((char *)"</s>");
   while (1) {
-    ReadWord(word, fin, &eof);
+    ReadWord(word, action_t, fin, &eof);
     if (eof) break;
     train_words++;
     wc++;
@@ -266,7 +272,7 @@ void LearnVocabFromTrainFile() {
       wc = 0;
     }
     i = SearchVocab(word);
-    if (i == -1) {
+    else if (i == -1) {
       a = AddWordToVocab(word);
       vocab[a].cn = 1;
     } else vocab[i].cn++;
@@ -291,6 +297,7 @@ void SaveVocab() {
 void ReadVocab() {
   long long a, i = 0;
   char c, eof = 0;
+  int action_t = 0;
   char word[MAX_STRING];
   FILE *fin = fopen(read_vocab_file, "rb");
   if (fin == NULL) {
@@ -300,7 +307,7 @@ void ReadVocab() {
   for (a = 0; a < vocab_hash_size; a++) vocab_hash[a] = -1;
   vocab_size = 0;
   while (1) {
-    ReadWord(word, fin, &eof);
+    ReadWord(word, action_t, fin, &eof);
     if (eof) break;
     a = AddWordToVocab(word);
     fscanf(fin, "%lld%c", &vocab[a].cn, &c);
@@ -370,10 +377,11 @@ void *TrainModelThread(void *id) {
       // 防止学习率过小，不小于初始学习率的万分之一
       if (alpha < starting_alpha * 0.0001) alpha = starting_alpha * 0.0001;
     }
-    //读入训练语料中的一个句子: 读入文件中的一行，或者读入某行中连续的1000词，下次接着读入
+    //读入训练语料中的一个句子: 读入文件中的一行，或者读入某行中连续的 MAX_SENTENCE_LENGTH 词，下次接着读入
     if (sentence_length == 0) {
       while (1) {
-        word = ReadWordIndex(fi, &eof);
+        Entity token;
+        ReadWordIndex(fi, &eof, &token);
         if (eof) break;
         if (word == -1) continue;
         word_count++;
@@ -433,6 +441,7 @@ void *TrainModelThread(void *id) {
         }
         l2 = target * layer1_size;
         f = 0;
+        // 向量相乘
         for (c = 0; c < layer1_size; c++) f += syn0[c + l1] * syn1neg[c + l2];
         if (f > MAX_EXP) g = (label - 1) * alpha;
         else if (f < -MAX_EXP) g = (label - 0) * alpha;
