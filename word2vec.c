@@ -560,7 +560,7 @@ void *TrainModelThread(void *id) {
         if (c >= sentence_length) continue;
         last_word = sen[c];
         if (last_word == -1) continue;
-        l1 = last_word * layer1_size;
+        l1 = last_word * layer1_size; // 上下文的词
         for (c = 0; c < layer1_size; c++) neu1e[c] = 0;
         // HIERARCHICAL SOFTMAX
         // 注意: Skip-Gram模型是对2c个上下文单词进行迭代更新，CBOW模型对目标词进行迭代更新（迭代更新HS的参数矩阵）。

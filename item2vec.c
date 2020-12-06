@@ -20,16 +20,16 @@
 
 /*
  *  仅使用 skip_gram + negative_sample 训练item_embedding;
- *  并尝试使用 加购item 作为 全局context
+ *  并尝试使用 购买item 作为 全局context
  */
 #define MAX_STRING 100
 #define EXP_TABLE_SIZE 1000
 #define MAX_EXP 6
 #define MAX_SENTENCE_LENGTH 1000
-#define MAX_CODE_LENGTH 40
 
 #define STR1(R) #R
 #define STR2(R) STR1(R)
+#define DEFAULT_ACTION 0
 
 const int vocab_hash_size = 30000000;  // Maximum 30 * 0.7 = 21M words in the vocabulary
 
@@ -44,6 +44,8 @@ struct vocab_word {
 typedef struct entity {
   int hash_idx;
   int action;
+  real weight;
+  char *categary;
 } Entity;
 
 // 行为序列需要加入具体行为标签
@@ -52,11 +54,12 @@ char save_vocab_file[MAX_STRING], read_vocab_file[MAX_STRING];
 
 // 商品表
 struct vocab_word *vocab;
-int binary = 0, debug_mode = 2, window = 5, min_count = 5, num_threads = 12, min_reduce = 1, use_global_context = 1;
+int binary = 0, debug_mode = 2, window = 5, min_count = 5, num_threads = 12, min_reduce = 1;
+int use_global_context = 1, global_label = 4;
 
 // 先算出词汇的hash，vocab_hash[hash]就是word在vocab中的下标
 int *vocab_hash;
-long long vocab_max_size = 1000, vocab_size = 0, layer1_size = 100;
+long long vocab_max_size = 10000, vocab_size = 0, layer1_size = 100;
 long long train_words = 0, word_count_actual = 0, iter = 5, file_size = 0, classes = 0;
 real alpha = 0.025, starting_alpha, sample = 1e-3;
 
@@ -97,7 +100,7 @@ void InitUnigramTable() {
 // 这里沿用word2vec.cc的原函数名, 只改传参, 为了方便两块代码做比较
 void ReadWord(char *word, int *action, FILE *fin, char *eof) {
   int a = 0, ch;
-  action = 0;
+  int action_t = DEFAULT_ACTION;
   while (1) {
     ch = fgetc_unlocked(fin);
     // 文件结尾，end of file
@@ -109,7 +112,7 @@ void ReadWord(char *word, int *action, FILE *fin, char *eof) {
     if (ch == 13) continue;
     if (ch == ':') {
       ch = fgetc_unlocked(fin);
-      action = ch - '0'; continue;
+      action_t = ch - '0'; continue;
     }
     if ((ch == ' ') || (ch == '\t') || (ch == '\n')) {
       if (a > 0) {
@@ -130,6 +133,7 @@ void ReadWord(char *word, int *action, FILE *fin, char *eof) {
   }
   // 最后一个字符为0，标志结束符
   word[a] = 0;
+  *action = action_t;
 }
 
 // Returns hash value of a word
@@ -156,10 +160,10 @@ int SearchVocab(char *word) {
 
 // Reads a word and returns its index in the vocabulary
 // 返回单词的position
-ReadWordIndex(FILE *fin, char *eof, Entity* ent) {
+int ReadWordIndex(FILE *fin, char *eof, Entity* ent) {
   char word[MAX_STRING], eof_l = 0;
-  int action = 0;
-  ReadWord(word, action, fin, &eof_l);
+  int action;
+  ReadWord(word, &action, fin, &eof_l);
   // 一直找到文件末尾
   if (eof_l) {
     *eof = 1;
@@ -167,6 +171,7 @@ ReadWordIndex(FILE *fin, char *eof, Entity* ent) {
   }
   ent->hash_idx = SearchVocab(word);
   ent->action = action;
+  return 1;
 }
 
 // Adds a word to the vocabulary
@@ -262,7 +267,7 @@ void LearnVocabFromTrainFile() {
   vocab_size = 0;
   AddWordToVocab((char *)"</s>");
   while (1) {
-    ReadWord(word, action_t, fin, &eof);
+    ReadWord(word, &action_t, fin, &eof);
     if (eof) break;
     train_words++;
     wc++;
@@ -272,7 +277,7 @@ void LearnVocabFromTrainFile() {
       wc = 0;
     }
     i = SearchVocab(word);
-    else if (i == -1) {
+    if (i == -1) {
       a = AddWordToVocab(word);
       vocab[a].cn = 1;
     } else vocab[i].cn++;
@@ -307,7 +312,7 @@ void ReadVocab() {
   for (a = 0; a < vocab_hash_size; a++) vocab_hash[a] = -1;
   vocab_size = 0;
   while (1) {
-    ReadWord(word, action_t, fin, &eof);
+    ReadWord(word, &action_t, fin, &eof);
     if (eof) break;
     a = AddWordToVocab(word);
     fscanf(fin, "%lld%c", &vocab[a].cn, &c);
@@ -349,12 +354,11 @@ void InitNet() {
 
 // id是线程的idx，如线程数4，id = {0, 1, 2, 3}
 void *TrainModelThread(void *id) {
-  long long a, b, d, cw, word, last_word, sentence_length = 0, sentence_position = 0;
+  long long a, b, d, cw, word, last_word, sentence_length = 0, sentence_position = 0, global_start_pos = -1;
   long long word_count = 0, last_word_count = 0, sen[MAX_SENTENCE_LENGTH + 1];
   long long l1, l2, c, target, label, local_iter = iter;
   unsigned long long next_random = (long long)id;
-  char eof = 0;
-  real f, g;
+  Entity token; int action = DEFAULT_ACTION; char eof = 0; real f, g;
   clock_t now;
   // 堆中分配 layer1_size 个 长度为 sizeof(real) 的连续空间
   // neu1e: 词向量权重的梯度
@@ -379,9 +383,10 @@ void *TrainModelThread(void *id) {
     }
     //读入训练语料中的一个句子: 读入文件中的一行，或者读入某行中连续的 MAX_SENTENCE_LENGTH 词，下次接着读入
     if (sentence_length == 0) {
+      global_start_pos = -1;
       while (1) {
-        Entity token;
         ReadWordIndex(fi, &eof, &token);
+        word = token.hash_idx; action = token.action;
         if (eof) break;
         if (word == -1) continue;
         word_count++;
@@ -397,6 +402,8 @@ void *TrainModelThread(void *id) {
           if (ran < (next_random & 0xFFFF) / (real)65536) continue;
         }
         sen[sentence_length] = word;
+        if (global_start_pos < 0 && action == global_label)
+          global_start_pos = sentence_length;
         sentence_length++;
         if (sentence_length >= MAX_SENTENCE_LENGTH) break;
       }
@@ -425,7 +432,7 @@ void *TrainModelThread(void *id) {
       if (c >= sentence_length) continue;
       last_word = sen[c];
       if (last_word == -1) continue;
-      l1 = last_word * layer1_size;
+      l1 = last_word * layer1_size; // 上下午的词
       for (c = 0; c < layer1_size; c++) neu1e[c] = 0;
       // NEGATIVE SAMPLING
       for (d = 0; d < negative + 1; d++) {
@@ -437,9 +444,12 @@ void *TrainModelThread(void *id) {
           target = table[(next_random >> 16) % table_size];
           if (target == 0) target = next_random % (vocab_size - 1) + 1;
           if (target == word) continue;
+          for(int i = global_start_pos; i < sentence_length; i ++) {
+            if(target == sen[i]) {d--; continue;}
+          }
           label = 0;
         }
-        l2 = target * layer1_size;
+        l2 = target * layer1_size;  // 中心词或者负采样的词
         f = 0;
         // 向量相乘
         for (c = 0; c < layer1_size; c++) f += syn0[c + l1] * syn1neg[c + l2];
@@ -453,6 +463,22 @@ void *TrainModelThread(void *id) {
       // 更新target的词向量
       // 注意: CBOW模型是对2c个上下文单词进行统一更新，Skip-Gram模型对目标词进行统一更新（统一更新词向量的参数矩阵）。
       for (c = 0; c < layer1_size; c++) syn0[c + l1] += neu1e[c];
+    }
+    for (int i = global_start_pos; i < sentence_length && sentence_position < i; i ++) {
+      last_word = sen[i];
+      if (last_word == -1) continue;
+      l1 = last_word * layer1_size; // 全局信息
+      l2 = word * layer1_size;  // 中心词
+      f = 0;
+      // 向量相乘
+      for (c = 0; c < layer1_size; c++) f += syn0[c + l1] * syn1neg[c + l2];
+      if (f > MAX_EXP) g = (label - 1) * alpha;
+      else if (f < -MAX_EXP) g = (label - 0) * alpha;
+      else g = (1 - expTable[(int)((f + MAX_EXP) * (EXP_TABLE_SIZE / MAX_EXP / 2))]) * alpha;
+      for (c = 0; c < layer1_size; c++) {
+        syn0[c + l1] += g * syn1neg[c + l2];
+        syn1neg[c + l2] += g * syn0[c + l1];
+      }
     }
     sentence_position++;
     if (sentence_position >= sentence_length) {
@@ -611,13 +637,10 @@ int main(int argc, char **argv) {
   if ((i = ArgPos((char *)"-read-vocab", argc, argv)) > 0) strcpy(read_vocab_file, argv[i + 1]);
   if ((i = ArgPos((char *)"-debug", argc, argv)) > 0) debug_mode = atoi(argv[i + 1]);
   if ((i = ArgPos((char *)"-binary", argc, argv)) > 0) binary = atoi(argv[i + 1]);
-  if ((i = ArgPos((char *)"-cbow", argc, argv)) > 0) cbow = atoi(argv[i + 1]);
-  if (cbow) alpha = 0.05;
   if ((i = ArgPos((char *)"-alpha", argc, argv)) > 0) alpha = atof(argv[i + 1]);
   if ((i = ArgPos((char *)"-output", argc, argv)) > 0) strcpy(output_file, argv[i + 1]);
   if ((i = ArgPos((char *)"-window", argc, argv)) > 0) window = atoi(argv[i + 1]);
   if ((i = ArgPos((char *)"-sample", argc, argv)) > 0) sample = atof(argv[i + 1]);
-  if ((i = ArgPos((char *)"-hs", argc, argv)) > 0) hs = atoi(argv[i + 1]);
   if ((i = ArgPos((char *)"-negative", argc, argv)) > 0) negative = atoi(argv[i + 1]);
   if ((i = ArgPos((char *)"-threads", argc, argv)) > 0) num_threads = atoi(argv[i + 1]);
   if ((i = ArgPos((char *)"-iter", argc, argv)) > 0) iter = atoi(argv[i + 1]);
